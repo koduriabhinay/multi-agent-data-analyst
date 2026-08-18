@@ -14,8 +14,22 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xls"}
-MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_ROWS = 1_000_000
+
+#: Formats people reach for that we deliberately don't support. Each gets a
+#: message saying what to do instead, because "unsupported format" alone
+#: leaves someone stuck with a file they can't use.
+CONVERSION_HINTS = {
+    ".numbers": "Numbers files can't be read directly. In Numbers, use File → Export To → CSV.",
+    ".gsheet": "Google Sheets shortcuts hold no data. In Sheets, use File → Download → CSV.",
+    ".json": "JSON isn't tabular. Convert it to CSV first.",
+    ".txt": "Plain text has no defined structure. If it's delimited, rename it to .csv or .tsv.",
+    ".pdf": "PDFs aren't spreadsheets. Export the table to CSV from wherever it came from.",
+    ".ods": "OpenDocument spreadsheets aren't supported. Save as .xlsx or .csv instead.",
+    ".parquet": "Parquet isn't supported yet. Export to CSV.",
+    ".zip": "Archives aren't unpacked. Upload the spreadsheet inside it directly.",
+}
 
 
 class IngestionError(ValueError):
@@ -27,19 +41,27 @@ def read_bytes(content: bytes, filename: str) -> pd.DataFrame:
     suffix = Path(filename).suffix.lower()
 
     if suffix not in SUPPORTED_EXTENSIONS:
+        accepted = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        hint = CONVERSION_HINTS.get(suffix)
+
+        if hint:
+            raise IngestionError(f"{hint} Accepted formats: {accepted}.")
+
         raise IngestionError(
-            f"'{suffix or filename}' isn't a supported format. "
-            f"Upload one of: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            f"'{suffix or filename}' isn't a supported file type. "
+            f"Upload a spreadsheet in one of these formats: {accepted}."
         )
 
     if len(content) > MAX_FILE_BYTES:
+        # One decimal place, because "0 MB" for an 11 MB limit reads as a bug
         raise IngestionError(
-            f"File is {len(content) / 1024 / 1024:.0f} MB. The limit is "
-            f"{MAX_FILE_BYTES // 1024 // 1024} MB."
+            f"That file is {len(content) / 1024 / 1024:.1f} MB and the limit is "
+            f"{MAX_FILE_BYTES // 1024 // 1024} MB. Try filtering it down or "
+            f"uploading a sample of the rows."
         )
 
     if not content:
-        raise IngestionError("The file is empty.")
+        raise IngestionError("That file is empty — there's nothing to analyse.")
 
     try:
         if suffix in {".xlsx", ".xls"}:
