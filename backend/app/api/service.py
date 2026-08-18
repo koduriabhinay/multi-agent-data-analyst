@@ -16,6 +16,7 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.db.models import Analysis, Chart, Report, SessionLocal
+from app.utils.serialization import json_safe
 from app.workflow.pipeline import run_pipeline
 from app.workflow.state import new_state
 
@@ -68,11 +69,13 @@ def _persist(session: Session, analysis_id: str, state: dict) -> None:
 
     analysis.status = state.get("status", "completed")
     analysis.error = state.get("error")
-    analysis.profile = state.get("profile")
-    analysis.plan = state.get("plan")
-    analysis.transformations = state.get("transformations")
-    analysis.results = state.get("results")
-    analysis.run_log = state.get("log")
+    # Sanitise on the way in, so nothing downstream has to worry about
+    # NaN or numpy scalars reaching a JSON encoder.
+    analysis.profile = json_safe(state.get("profile"))
+    analysis.plan = json_safe(state.get("plan"))
+    analysis.transformations = json_safe(state.get("transformations"))
+    analysis.results = json_safe(state.get("results"))
+    analysis.run_log = json_safe(state.get("log"))
     analysis.completed_at = datetime.now(UTC)
 
     clean_df = state.get("clean_df")
@@ -87,7 +90,7 @@ def _persist(session: Session, analysis_id: str, state: dict) -> None:
                 chart_type=chart["chart_type"],
                 title=chart["title"],
                 description=chart.get("description"),
-                plotly_json=chart["plotly_json"],
+                plotly_json=json_safe(chart["plotly_json"]),
             )
         )
 
@@ -98,7 +101,7 @@ def _persist(session: Session, analysis_id: str, state: dict) -> None:
                 analysis_id=analysis_id,
                 markdown=report["markdown"],
                 narrative=report.get("narrative"),
-                key_findings=report.get("key_findings"),
+                key_findings=json_safe(report.get("key_findings")),
             )
         )
 

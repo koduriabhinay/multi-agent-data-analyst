@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from app.agents.base import BaseAgent
+from app.utils.serialization import json_safe
 from app.workflow.state import WorkflowState
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,9 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
         # Low-cardinality categoricals are the ones worth grouping by
         "groupable_columns": [c for c in categorical if 1 < df[c].nunique() <= 20],
         "duplicate_rows": int(df.duplicated().sum()),
-        "sample_rows": df.head(3).to_dict(orient="records"),
+        # Sanitised here because sample rows carry NaN and Timestamps straight
+        # out of the dataframe, and this dict gets persisted as JSON.
+        "sample_rows": json_safe(df.head(3).to_dict(orient="records")),
     }
 
 
