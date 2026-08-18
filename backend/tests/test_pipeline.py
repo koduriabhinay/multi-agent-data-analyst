@@ -232,3 +232,56 @@ class TestSerializationHelper:
 
         messy = {"a": [np.float64("nan"), pd.Timestamp("2024-01-01")], "b": {"c": np.int32(3)}}
         json.dumps(json_safe(messy), allow_nan=False)  # raises if anything leaked
+
+
+class TestErrorClassification:
+    """Retrying a quota error just multiplies the delay before falling back."""
+
+    def test_quota_exhaustion_is_permanent(self):
+        from app.utils.llm import _is_permanent
+
+        exc = Exception("Error code: 429 - {'error': {'code': 'credit_balance_exhausted'}}")
+        assert _is_permanent(exc) is True
+
+    def test_bad_key_is_permanent(self):
+        from app.utils.llm import _is_permanent
+
+        assert _is_permanent(Exception("invalid_api_key")) is True
+
+    def test_rate_limit_is_worth_retrying(self):
+        from app.utils.llm import _is_permanent
+
+        assert _is_permanent(Exception("429 rate_limit_exceeded, slow down")) is False
+
+    def test_timeout_is_worth_retrying(self):
+        from app.utils.llm import _is_permanent
+
+        assert _is_permanent(Exception("Connection timed out")) is False
+
+    def test_quota_error_explains_the_subscription_confusion(self):
+        from app.utils.llm import _explain
+
+        message = _explain(Exception("insufficient_quota"))
+        assert "credit" in message.lower()
+        assert "subscription" in message.lower()
+
+    def test_permanent_failure_stops_retrying_and_goes_offline(self):
+        from app.utils.llm import LLMClient, LLMError
+
+        client = LLMClient.__new__(LLMClient)  # skip __init__ and its API probe
+        client.offline = False
+        client.provider = "openai"
+
+        calls = {"n": 0}
+
+        def always_out_of_credit(prompt, system):
+            calls["n"] += 1
+            raise Exception("Error code: 429 - insufficient_quota")
+
+        client._call = always_out_of_credit
+
+        with pytest.raises(LLMError, match="no credit"):
+            client.ask("anything")
+
+        assert calls["n"] == 1, "should not retry a permanent failure"
+        assert client.offline is True, "later agents should skip the model entirely"
