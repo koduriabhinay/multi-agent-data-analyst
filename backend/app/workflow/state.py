@@ -50,6 +50,9 @@ class WorkflowState(TypedDict, total=False):
     # --- Written by ReporterAgent ----------------------------------------
     report: dict[str, Any]
 
+    # --- Written by the cost ledger ---------------------------------------
+    cost: dict[str, Any]
+
     # --- Bookkeeping ------------------------------------------------------
     status: str  # "running" | "completed" | "failed"
     current_agent: str

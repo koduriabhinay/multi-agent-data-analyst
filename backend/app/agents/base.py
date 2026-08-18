@@ -37,6 +37,9 @@ class BaseAgent(ABC):
         state["current_agent"] = self.name
         self.note = ""
 
+        # So the ledger can attribute spend to the agent that caused it
+        self.llm.agent = self.name
+
         try:
             log.info("[%s] starting", self.name)
             state = self.run(state)
