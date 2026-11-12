@@ -4,6 +4,7 @@ Run an analysis from the command line — no server, no database.
 
     python -m app.cli data_samples/employees.csv
     python -m app.cli data.csv --out report.md
+    python -m app.cli data.csv --html report.html --open
 
 Useful for debugging agents and for CI, where spinning up a server just to
 check the pipeline still works would be overkill.
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.data.ingestion import IngestionError, read_path  # noqa: E402
+from app.export import render_report  # noqa: E402
 from app.workflow.pipeline import run_pipeline  # noqa: E402
 from app.workflow.state import new_state  # noqa: E402
 
@@ -41,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("file", help="Path to a .csv, .tsv, .xlsx or .xls file")
     parser.add_argument("-o", "--out", help="Write the report here (default: print to stdout)")
+    parser.add_argument("--html", help="Write a browsable HTML report here")
+    parser.add_argument(
+        "--open", action="store_true", help="Open the HTML report when it's written"
+    )
     parser.add_argument("--charts", help="Directory to save chart JSON into")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show agent logs")
 
@@ -78,10 +84,21 @@ def main(argv: list[str] | None = None) -> int:
 
     markdown = state["report"]["markdown"]
 
+    if args.html:
+        html_path = Path(args.html)
+        html_path.write_text(render_report(state), encoding="utf-8")
+        size_kb = html_path.stat().st_size / 1024
+        print(f"HTML report written to {html_path}  ({size_kb:,.0f} KB)")
+
+        if args.open:
+            import webbrowser
+
+            webbrowser.open(html_path.resolve().as_uri())
+
     if args.out:
         Path(args.out).write_text(markdown, encoding="utf-8")
         print(f"Report written to {args.out}")
-    else:
+    elif not args.html:
         print("─" * 70)
         print(markdown)
 

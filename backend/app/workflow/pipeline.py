@@ -23,6 +23,7 @@ from app.agents import (
     ReporterAgent,
     VisualizerAgent,
 )
+from app.utils.cost import CostLedger
 from app.utils.llm import LLMClient
 from app.workflow.state import WorkflowState
 
@@ -42,8 +43,12 @@ PROGRESS = {
 
 
 def build_agents(llm: LLMClient | None = None) -> dict[str, Any]:
-    """One shared LLM client across all agents, so connection setup happens once."""
-    llm = llm or LLMClient()
+    """One shared LLM client across all agents.
+
+    Sharing matters for more than setup cost: the client owns the prompt cache
+    and the cost ledger, so every agent contributes to the same totals.
+    """
+    llm = llm or LLMClient(ledger=CostLedger())
     return {
         "planner": PlannerAgent(llm),
         "cleaner": CleanerAgent(llm),
@@ -82,11 +87,22 @@ def run_pipeline(
     can stream updates to a UI. Errors are captured in state rather than raised,
     so a partial result is still returned.
     """
+    agents = build_agents(llm)
+    shared_llm = agents["planner"].llm
+
     try:
-        return _run_with_langgraph(state, llm, on_progress)
+        final = _run_with_langgraph(state, shared_llm, on_progress)
     except ImportError:
         log.info("LangGraph not installed — running agents directly")
-        return run_pipeline_sync(state, llm, on_progress)
+        final = run_pipeline_sync(state, shared_llm, on_progress)
+
+    final["cost"] = shared_llm.ledger.summary()
+    log.info(
+        "Run cost $%.5f across %d billed calls",
+        shared_llm.ledger.total_cost,
+        shared_llm.ledger.billed_calls,
+    )
+    return final
 
 
 def _run_with_langgraph(

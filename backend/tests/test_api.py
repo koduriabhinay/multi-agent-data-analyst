@@ -65,7 +65,7 @@ class TestUpload:
             files={"file": ("notes.txt", io.BytesIO(b"hello"), "text/plain")},
         )
         assert response.status_code == 400
-        assert "supported format" in response.json()["detail"]
+        assert "Accepted formats" in response.json()["detail"]
 
     def test_rejects_a_single_column_csv(self, client):
         response = client.post(

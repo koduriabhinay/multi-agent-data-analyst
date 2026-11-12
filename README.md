@@ -144,7 +144,8 @@ Everything has a working default except the API key. See `.env.example`.
 |---|---|---|
 | `ANTHROPIC_API_KEY` | *(unset)* | Blank means offline mode |
 | `LLM_PROVIDER` | `anthropic` | Or `openai` |
-| `LLM_MODEL` | `claude-sonnet-4-6` | |
+| `LLM_MODEL` | `claude-sonnet-4-6` | Used for the Reporter's narrative |
+| `PLANNER_MODEL` | *(auto)* | Cheaper model for the Planner's fixed-choice decision — defaults to Haiku/gpt-4o-mini depending on provider |
 | `DATABASE_URL` | `sqlite:///./analyst.db` | Postgres works unchanged |
 | `LOG_LEVEL` | `INFO` | |
 

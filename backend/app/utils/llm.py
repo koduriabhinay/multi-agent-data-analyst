@@ -13,6 +13,7 @@ burning tokens.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -20,9 +21,25 @@ import re
 import time
 from typing import Any
 
+from app.utils.cost import CostLedger
+
 log = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
+
+#: The provider SDKs retry internally by default (2 extra attempts each). Left
+#: alone, that multiplies with our own loop: 3 x 3 = 9 requests per call. We
+#: handle retries here, where we can distinguish permanent failures, so the
+#: SDK's own retrying is switched off.
+SDK_RETRIES = 0
+
+#: A cheaper model of the same provider, for calls that don't need frontier
+#: reasoning — picking from a fixed list is one of them. Overridable with
+#: PLANNER_MODEL for anyone who wants a specific model instead.
+CHEAP_MODEL = {
+    "anthropic": "claude-haiku-4-5",
+    "openai": "gpt-4o-mini",
+}
 
 
 class LLMError(RuntimeError):
@@ -36,6 +53,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        ledger: CostLedger | None = None,
     ) -> None:
         self.provider = provider or os.getenv("LLM_PROVIDER", "anthropic")
         self.model = model or os.getenv("LLM_MODEL", "claude-sonnet-4-6")
@@ -43,6 +61,21 @@ class LLMClient:
         self.max_tokens = max_tokens
         self._client = None
         self.offline = False
+
+        #: Shared across every agent in a run, so costs accumulate in one place.
+        self.ledger = ledger or CostLedger()
+
+        #: Set by each agent before it calls, so the ledger knows who spent what.
+        self.agent = "unknown"
+
+        #: Identical prompts return the identical answer, so there is no reason
+        #: to pay twice. Keyed by a hash of the prompt and system message.
+        self._cache: dict[str, str] = {}
+
+        #: A cheaper model an agent can opt into via ask(..., model=...).
+        #: Falls back to the main model itself if nothing cheaper is known for
+        #: this provider, so passing it is always safe.
+        self.cheap_model = os.getenv("PLANNER_MODEL") or CHEAP_MODEL.get(self.provider, self.model)
 
         try:
             self._client = self._build_client()
@@ -60,7 +93,7 @@ class LLMClient:
                 raise LLMError("ANTHROPIC_API_KEY not set")
             from anthropic import Anthropic
 
-            return Anthropic(api_key=key)
+            return Anthropic(api_key=key, max_retries=SDK_RETRIES)
 
         if self.provider == "openai":
             key = os.getenv("OPENAI_API_KEY")
@@ -68,22 +101,41 @@ class LLMClient:
                 raise LLMError("OPENAI_API_KEY not set")
             from openai import OpenAI
 
-            return OpenAI(api_key=key)
+            return OpenAI(api_key=key, max_retries=SDK_RETRIES)
 
         raise LLMError(f"Unknown provider: {self.provider}")
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def ask(self, prompt: str, system: str = "") -> str:
-        """Send a prompt, get raw text back."""
+    def ask(self, prompt: str, system: str = "", model: str | None = None) -> str:
+        """Send a prompt, get raw text back.
+
+        `model` lets a specific call opt into a cheaper model than the
+        client's default — e.g. self.llm.ask(prompt, model=self.llm.cheap_model)
+        for a call that doesn't need frontier reasoning. Omit it and the
+        client's configured model is used, unchanged.
+        """
+        model = model or self.model
+
         if self.offline:
             return _stub_response(prompt)
+
+        # An identical prompt to the same model returns an identical answer,
+        # so paying twice buys nothing. This matters most during development,
+        # where the same file gets analysed over and over.
+        key = _cache_key(model, system, prompt)
+        if key in self._cache:
+            self.ledger.record_cache_hit(self.agent, model)
+            log.info("[%s] cache hit, no request sent", self.agent)
+            return self._cache[key]
 
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
-                return self._call(prompt, system)
+                answer = self._call(prompt, system, model)
+                self._cache[key] = answer
+                return answer
             except Exception as exc:
                 last_error = exc
 
@@ -110,7 +162,11 @@ class LLMClient:
         raise LLMError(f"LLM failed after {MAX_RETRIES} attempts: {last_error}")
 
     def ask_json(
-        self, prompt: str, system: str = "", fallback: dict | None = None
+        self,
+        prompt: str,
+        system: str = "",
+        fallback: dict | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """Send a prompt and parse the reply as JSON.
 
@@ -119,7 +175,7 @@ class LLMClient:
         """
         system = system or "Reply with valid JSON only. No prose, no markdown fences."
         try:
-            raw = self.ask(prompt, system)
+            raw = self.ask(prompt, system, model=model)
             return extract_json(raw)
         except (LLMError, ValueError) as exc:
             log.warning("JSON parse failed, using fallback: %s", exc)
@@ -130,19 +186,27 @@ class LLMClient:
     # ------------------------------------------------------------------
     # Provider-specific calls
     # ------------------------------------------------------------------
-    def _call(self, prompt: str, system: str) -> str:
+    def _call(self, prompt: str, system: str, model: str | None = None) -> str:
+        model = model or self.model
+
         if self.provider == "anthropic":
             resp = self._client.messages.create(
-                model=self.model,
+                model=model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 system=system or "You are a precise data analyst.",
                 messages=[{"role": "user", "content": prompt}],
             )
+            self.ledger.record(
+                self.agent,
+                model,
+                resp.usage.input_tokens,
+                resp.usage.output_tokens,
+            )
             return "".join(block.text for block in resp.content if block.type == "text")
 
         resp = self._client.chat.completions.create(
-            model=self.model,
+            model=model,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             messages=[
@@ -150,12 +214,23 @@ class LLMClient:
                 {"role": "user", "content": prompt},
             ],
         )
+        self.ledger.record(
+            self.agent,
+            model,
+            resp.usage.prompt_tokens,
+            resp.usage.completion_tokens,
+        )
         return resp.choices[0].message.content or ""
 
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def _cache_key(model: str, system: str, prompt: str) -> str:
+    """Hash the full request, so a changed prompt is a different key."""
+    return hashlib.sha256(f"{model}\x00{system}\x00{prompt}".encode()).hexdigest()
+
+
 def _is_permanent(exc: Exception) -> bool:
     """Is this an error that retrying will never fix?
 

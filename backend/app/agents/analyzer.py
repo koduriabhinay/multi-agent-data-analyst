@@ -19,6 +19,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
 from app.agents.base import BaseAgent
+from app.agents.cleaner import ROW_REF_COLUMN
 from app.workflow.state import WorkflowState
 
 log = logging.getLogger(__name__)
@@ -91,6 +92,8 @@ class AnalyzerAgent(BaseAgent):
             }
 
         for col in df.select_dtypes(include=["object", "category"]).columns:
+            if col == ROW_REF_COLUMN:
+                continue  # every value is unique by design; nothing to summarise
             s = df[col].dropna()
             if s.empty:
                 continue
@@ -174,7 +177,7 @@ class AnalyzerAgent(BaseAgent):
         group_cols = [
             c
             for c in df.select_dtypes(include=["object", "category"]).columns
-            if 1 < df[c].nunique() <= 20
+            if c != ROW_REF_COLUMN and 1 < df[c].nunique() <= 20
         ]
 
         comparisons = []

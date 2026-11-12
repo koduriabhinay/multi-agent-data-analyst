@@ -12,6 +12,7 @@ narrative, not the report.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 
 from app.agents.base import BaseAgent
@@ -19,32 +20,63 @@ from app.workflow.state import WorkflowState
 
 log = logging.getLogger(__name__)
 
+#: A causal claim is a stronger statement than what a correlation supports.
+#: The prompt already says not to make one; this catches it if the model
+#: does anyway, since an instruction in a prompt is a request, not a guarantee.
+CAUSAL_LANGUAGE = re.compile(
+    r"\b(causes?|caused by|leads? to|results? in|driven by|due to|because of)\b",
+    re.IGNORECASE,
+)
+
+#: Numbers worth checking are ones that read as a statistic — a decimal or a
+#: percentage. Plain integers ("the two caveats below") are prose, not data,
+#: and checking them produces far more false positives than real catches.
+NUMERIC_CLAIM = re.compile(r"-?\d[\d,]*\.\d+%?|-?\d[\d,]*%")
+
 
 class ReporterAgent(BaseAgent):
     name = "reporter"
 
     def run(self, state: WorkflowState) -> WorkflowState:
-        brief = self._build_brief(state)
+        brief, grounded_values = self._build_brief(state)
         narrative = self._write_narrative(brief)
+        grounding = self._check_grounding(narrative, grounded_values)
         findings = self._extract_findings(state)
 
-        markdown = self._assemble(state, narrative, findings)
+        markdown = self._assemble(state, narrative, findings, grounding)
 
         state["report"] = {
             "markdown": markdown,
             "narrative": narrative,
             "key_findings": findings,
+            "grounding_check": grounding,
             "generated_at": datetime.now(UTC).isoformat(),
         }
         state["status"] = "completed"
         self.note = f"{len(findings)} key findings"
+        if grounding["ungrounded_numbers"] or grounding["causal_language"]:
+            self.note += " (grounding check flagged items — see report)"
         return state
 
     # ------------------------------------------------------------------
-    def _build_brief(self, state: WorkflowState) -> str:
-        """Compact factual summary — this is all the model gets to see."""
+    def _build_brief(self, state: WorkflowState) -> tuple[str, set[float]]:
+        """Compact factual summary — this is all the model gets to see.
+
+        Also returns every number embedded in it. That set is the ground
+        truth the narrative gets checked against afterward — not a separate
+        guess at what's "correct", just the exact values already handed to
+        the model, so a mismatch means the model wrote a number it wasn't
+        given, not that our own tracking disagrees with itself.
+        """
         profile = state.get("profile", {})
         results = state.get("results", {})
+        values: set[float] = set()
+
+        def note(*nums: float | int | None) -> None:
+            for n in nums:
+                if n is not None:
+                    values.add(float(n))
+
         lines = [
             f"Dataset: {state.get('filename', 'uploaded file')}",
             f"Shape: {profile.get('rows')} rows x {profile.get('columns')} columns",
@@ -61,6 +93,7 @@ class ReporterAgent(BaseAgent):
                 f"{col}: mean={stats_dict['mean']}, median={stats_dict['median']}, "
                 f"std={stats_dict['std']}, skew={stats_dict['skew']}"
             )
+            note(stats_dict["mean"], stats_dict["median"], stats_dict["std"], stats_dict["skew"])
 
         for pair in results.get("correlation", {}).get("notable_pairs", [])[:5]:
             lines.append(
@@ -68,12 +101,14 @@ class ReporterAgent(BaseAgent):
                 f"r={pair['r']}, p={pair['p_value']}, "
                 f"significant={pair['significant']}"
             )
+            note(pair["r"], pair["p_value"])
 
         for test in results.get("group_comparison", {}).get("comparisons", [])[:5]:
             lines.append(
                 f"Group test: {test['value_column']} across {test['group_column']} "
                 f"({test['test']}) p={test['p_value']}, significant={test['significant']}"
             )
+            note(test["p_value"])
 
         anomalies = results.get("outlier_detection", {})
         if anomalies.get("count"):
@@ -81,6 +116,7 @@ class ReporterAgent(BaseAgent):
                 f"Anomalies: {anomalies['count']} rows "
                 f"({anomalies['percentage']}%) flagged by Isolation Forest"
             )
+            note(anomalies["count"], anomalies["percentage"])
 
         regression = results.get("regression", {})
         if regression.get("r2_score") is not None:
@@ -89,8 +125,12 @@ class ReporterAgent(BaseAgent):
                 f"Model: predicting {regression['target']}, "
                 f"R2={regression['r2_score']}, strongest predictor={top}"
             )
+            note(regression["r2_score"])
 
-        return "\n".join(lines)
+        # Row/column counts are legitimate things to restate in prose
+        note(profile.get("rows"), profile.get("columns"))
+
+        return "\n".join(lines), values
 
     def _write_narrative(self, brief: str) -> str:
         prompt = f"""Here are the results of a data analysis:
@@ -115,6 +155,48 @@ Rules:
         except Exception as exc:
             log.warning("Narrative generation failed: %s", exc)
             return "_Narrative unavailable — the language model could not be reached._"
+
+    def _check_grounding(self, narrative: str, grounded_values: set[float]) -> dict:
+        """Best-effort check that numbers in the narrative trace back to the brief.
+
+        Not a hard gate — a false positive here (a real number that legitimately
+        got rounded or converted to a percentage differently than expected)
+        shouldn't block the report, so this flags for a human to glance at
+        rather than rewriting or rejecting anything. What it catches: a number
+        that appears nowhere in what the model was actually given, which is
+        the specific failure mode "use only the numbers given above" exists
+        to prevent.
+
+        Deliberately loose on tolerance (rounding, sign, fraction-vs-percent
+        conversion) to avoid crying wolf on correct paraphrasing — it would
+        rather miss a subtle fabrication than flag normal rounding on every
+        report.
+        """
+        candidates: set[float] = set()
+        for v in grounded_values:
+            for form in (v, abs(v), v * 100, abs(v) * 100, v / 100):
+                for precision in (0, 1, 2, 3):
+                    candidates.add(round(form, precision))
+
+        def is_grounded(x: float) -> bool:
+            return any(abs(x - c) <= max(0.05, 0.01 * abs(c)) for c in candidates)
+
+        ungrounded = []
+        for match in NUMERIC_CLAIM.finditer(narrative):
+            token = match.group().replace(",", "")
+            try:
+                value = float(token.rstrip("%"))
+            except ValueError:
+                continue
+            if not is_grounded(value):
+                ungrounded.append(match.group())
+
+        causal_hits = sorted({m.group() for m in CAUSAL_LANGUAGE.finditer(narrative)})
+
+        return {
+            "ungrounded_numbers": sorted(set(ungrounded)),
+            "causal_language": causal_hits,
+        }
 
     def _extract_findings(self, state: WorkflowState) -> list[str]:
         """Deterministic bullet points, derived straight from the numbers."""
@@ -164,7 +246,9 @@ Rules:
 
         return findings or ["No statistically significant patterns surfaced in this dataset."]
 
-    def _assemble(self, state: WorkflowState, narrative: str, findings: list[str]) -> str:
+    def _assemble(
+        self, state: WorkflowState, narrative: str, findings: list[str], grounding: dict
+    ) -> str:
         profile = state.get("profile", {})
         parts = [
             f"# Analysis: {state.get('filename', 'dataset')}",
@@ -178,6 +262,18 @@ Rules:
             "",
         ]
         parts.extend(f"- {f}" for f in findings)
+
+        # Silent when clean — this is a QA signal for the rare case, not a
+        # section every report carries. Not a claim any flagged item is
+        # wrong, just that it couldn't be traced back to a computed value.
+        if grounding["ungrounded_numbers"] or grounding["causal_language"]:
+            parts += ["", "## Narrative quality check", ""]
+            if grounding["ungrounded_numbers"]:
+                nums = ", ".join(grounding["ungrounded_numbers"])
+                parts.append(f"- Numbers in the narrative not traced to a computed value: {nums}")
+            if grounding["causal_language"]:
+                phrases = ", ".join(f'"{p}"' for p in grounding["causal_language"])
+                parts.append(f"- Causal language used despite the correlation-only data: {phrases}")
 
         changes = state.get("transformations", [])
         if changes:

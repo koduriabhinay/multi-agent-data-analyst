@@ -28,3 +28,5 @@ Thumbs.db
 data_samples/*.csv
 data_samples/*.xlsx
 out/
+report.html
+*.html

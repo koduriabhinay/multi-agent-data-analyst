@@ -10,7 +10,9 @@ No LLM call here. Cleaning rules should be deterministic and reproducible.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from typing import Any
 
 import numpy as np
@@ -27,6 +29,30 @@ DROP_COLUMN_NULL_THRESHOLD = 0.60
 #: Standard Tukey fence multiplier for outlier flagging.
 IQR_MULTIPLIER = 1.5
 
+#: Name of the synthetic reference column added when a file has no natural
+#: identifier. Reserved — Planner and Analyzer both know to exclude it from
+#: statistics by this exact name, so don't rename it without updating them.
+ROW_REF_COLUMN = "row_ref"
+
+#: A column already looks like an identifier if its name suggests one...
+ID_LIKE_NAME = re.compile(r"(?i)(^|_)(id|uuid|guid|key)($|_)|name$")
+
+#: ...or if almost every value is unique, whatever it's called — but only
+#: trusted for whole-number/text columns with enough rows to mean something.
+#: A float column (salary, a credit score with decimals) looks "unique" at
+#: almost any size purely because it's continuous data, not because it's an
+#: identifier — and at a handful of rows, even an int column looks unique by
+#: chance. Neither should suppress the reference column.
+ID_LIKE_UNIQUENESS = 0.95
+ID_LIKE_MIN_ROWS = 20
+
+#: base36 length for the synthetic reference. 6 chars = 36^6 ≈ 2.18 billion
+#: combinations — collisions between genuinely different rows are extended
+#: automatically if they ever happen (see _ensure_row_reference), but at this
+#: length they won't for any file this project's 10 MB cap will admit.
+ROW_REF_LENGTH = 6
+ROW_REF_MAX_LENGTH = 12
+
 
 class CleanerAgent(BaseAgent):
     name = "cleaner"
@@ -38,6 +64,7 @@ class CleanerAgent(BaseAgent):
 
         df = self._drop_empty_columns(df, changes)
         df = self._drop_duplicates(df, changes)
+        df = self._ensure_row_reference(df, changes)
         df = self._coerce_types(df, changes)
         df = self._impute_missing(df, changes)
         self._flag_outliers(df, changes)
@@ -78,6 +105,64 @@ class CleanerAgent(BaseAgent):
                     "detail": f"Removed {n_dupes} exact duplicate rows.",
                 }
             )
+        return df
+
+    def _ensure_row_reference(self, df: pd.DataFrame, changes: list) -> pd.DataFrame:
+        """Give every row a stable label, if nothing already does that job.
+
+        Exact-duplicate detection compares every column, so it never needs an
+        ID to work correctly — two different people can't become "the same
+        row" just because an ID column exists to tell them apart. What an ID
+        actually helps with is everything downstream: pointing at a specific
+        row in a report ("row A3F91K was flagged as an outlier") when the
+        file has nothing else to call it.
+
+        Deliberately content-derived, not random: a random ID assigned before
+        dedup would make every row unique by construction and silently
+        disable duplicate detection. A hash of the row's own values doesn't
+        have that problem — identical rows still hash identically, so this
+        step changes nothing about what dedup catches. It also means the
+        same file produces the same IDs on every run.
+        """
+        if df.empty or _has_identifier_column(df):
+            return df
+
+        # Row-wise, so cost scales with rows — fine at this project's 10 MB
+        # upload cap, worth knowing if that cap ever changes.
+        # Not df.astype(str) — on newer pandas that can leave NaN as an actual
+        # float rather than stringifying it (dtype-dependent), which breaks
+        # the join on any column with missing values. Python's own str() has
+        # no such ambiguity.
+        canonical = df.apply(lambda row: "\x1f".join(str(v) for v in row), axis=1)
+        digests = canonical.map(lambda s: hashlib.sha256(s.encode()).hexdigest())
+
+        length = ROW_REF_LENGTH
+        while length <= ROW_REF_MAX_LENGTH:
+            ids = digests.map(lambda h, n=length: _base36(int(h[:16], 16), n))
+            if not ids.duplicated().any():
+                break
+            length += 1  # a truncation collision between two *different* rows
+        else:
+            log.warning(
+                "Could not find collision-free row references up to %d chars; "
+                "some rows may share a reference label.",
+                ROW_REF_MAX_LENGTH,
+            )
+
+        df = df.copy()
+        df.insert(0, ROW_REF_COLUMN, ids.values)
+
+        changes.append(
+            {
+                "step": "add_row_reference",
+                "column": ROW_REF_COLUMN,
+                "detail": (
+                    f"No identifier column found, so added '{ROW_REF_COLUMN}' "
+                    f"({length}-character reference derived from each row's own "
+                    f"values) so individual rows can be referred to in the report."
+                ),
+            }
+        )
         return df
 
     def _coerce_types(self, df: pd.DataFrame, changes: list) -> pd.DataFrame:
@@ -183,3 +268,49 @@ def _looks_like_dates(sample: pd.Series) -> bool:
     text = sample.astype(str).head(20)
     hits = text.str.contains(r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}", regex=True)
     return bool(hits.mean() > 0.5)
+
+
+def _has_identifier_column(df: pd.DataFrame) -> bool:
+    """Does this file already have something that tells rows apart?
+
+    Checked by name (id, uuid, key, anything ending in "name") and by shape
+    (almost every value unique, whatever the column is called) — either is
+    enough, so an "account_number" column with no obvious name-match still
+    counts if its values are in fact all distinct.
+    """
+    n = len(df)
+    if n <= 1:
+        return True  # nothing to disambiguate
+
+    for col in df.columns:
+        if ID_LIKE_NAME.search(str(col)):
+            return True
+
+        if (
+            n >= ID_LIKE_MIN_ROWS
+            and not pd.api.types.is_float_dtype(df[col])
+            and df[col].nunique(dropna=True) / n >= ID_LIKE_UNIQUENESS
+        ):
+            return True
+
+    return False
+
+
+_BASE36_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _base36(n: int, length: int) -> str:
+    """Encode a non-negative int as uppercase base36, padded/truncated to `length`.
+
+    Base36 rather than raw hex so the label reads like a normal reference code
+    (order confirmations, license plates) instead of looking like a hash.
+    """
+    if n == 0:
+        digits = "0"
+    else:
+        digits = ""
+        while n:
+            n, rem = divmod(n, 36)
+            digits = _BASE36_ALPHABET[rem] + digits
+
+    return digits[-length:].rjust(length, "0")
