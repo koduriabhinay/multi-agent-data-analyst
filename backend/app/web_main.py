@@ -1,5 +1,7 @@
 """Run MADA as a web server."""
+
 import uvicorn
+
 from app.web_api import create_web_app
 
 if __name__ == "__main__":
