@@ -1,30 +1,30 @@
 # Web framework
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
-pydantic==2.10.4
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+pydantic==2.13.5
 
 # Agent orchestration
-langgraph==0.2.60
-langchain-core==0.3.28
+langgraph==1.2.11
+langchain-core==1.6.3
 
 # Language models
-anthropic==0.42.0
-openai==1.59.2
+anthropic==1.5.0
+openai==3.14.0
 
 # Data and statistics
-pandas==2.2.3
-numpy==2.2.1
-scipy==1.15.0
-scikit-learn==1.6.0
-statsmodels==0.14.4
+pandas==3.0.5
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+statsmodels==0.15.0
 openpyxl==3.1.5
 
 # Charts
-plotly==5.24.1
+plotly==7.0.0
 
 # Persistence
-SQLAlchemy==2.0.36
+SQLAlchemy==2.0.53
 
 # Configuration
-python-dotenv==1.0.1
+python-dotenv==1.2.3
