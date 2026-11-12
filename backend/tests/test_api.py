@@ -127,9 +127,7 @@ class TestSerialization:
             rows.append(f"{value},{i * 3},2024-01-{i % 28 + 1:02d}")
         upload = ("gappy.csv", io.BytesIO("\n".join(rows).encode()), "text/csv")
 
-        analysis_id = client.post("/api/analyses", files={"file": upload}).json()[
-            "analysis_id"
-        ]
+        analysis_id = client.post("/api/analyses", files={"file": upload}).json()["analysis_id"]
 
         response = client.get(f"/api/analyses/{analysis_id}")
         assert response.status_code == 200
@@ -138,9 +136,7 @@ class TestSerialization:
     def test_stored_payload_is_json_encodable(self, client, csv_upload):
         import json
 
-        analysis_id = client.post("/api/analyses", files={"file": csv_upload}).json()[
-            "analysis_id"
-        ]
+        analysis_id = client.post("/api/analyses", files={"file": csv_upload}).json()["analysis_id"]
         body = client.get(f"/api/analyses/{analysis_id}").json()
 
         # allow_nan=False is what a strict JSON encoder does — this is the

@@ -86,8 +86,24 @@ class LLMClient:
                 return self._call(prompt, system)
             except Exception as exc:
                 last_error = exc
+
+                # No amount of waiting fixes an exhausted quota or a bad key.
+                # Retrying just multiplies the delay before the caller can fall
+                # back, so stop now and switch to offline for the rest of the run.
+                if _is_permanent(exc):
+                    reason = _explain(exc)
+                    log.error("Language model unavailable: %s", reason)
+                    self.offline = True
+                    raise LLMError(reason) from exc
+
                 wait = 2**attempt
-                log.warning("LLM call failed (attempt %d): %s", attempt + 1, exc)
+                log.warning(
+                    "LLM call failed (attempt %d of %d), retrying in %ds: %s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    wait,
+                    exc,
+                )
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(wait)
 
@@ -140,6 +156,58 @@ class LLMClient:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def _is_permanent(exc: Exception) -> bool:
+    """Is this an error that retrying will never fix?
+
+    Quota exhaustion, invalid keys, and unknown model names all fail
+    identically on every attempt. Rate limits and timeouts are worth a retry;
+    these are not.
+    """
+    text = str(exc).lower()
+    permanent_markers = (
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "billing",
+        "invalid_api_key",
+        "invalid x-api-key",
+        "authentication_error",
+        "incorrect api key",
+        "permission_denied",
+        "model_not_found",
+        "does not exist or you do not have access",
+    )
+    return any(marker in text for marker in permanent_markers)
+
+
+def _explain(exc: Exception) -> str:
+    """Translate a provider error into something the user can act on."""
+    text = str(exc).lower()
+
+    if "insufficient_quota" in text or "credit_balance_exhausted" in text or "billing" in text:
+        return (
+            "Your API account has no credit. An OpenAI or Anthropic API balance is "
+            "separate from a ChatGPT or Claude subscription — add credit in the "
+            "provider's billing settings. Statistics and charts still work without it."
+        )
+
+    if any(
+        m in text
+        for m in ("invalid_api_key", "invalid x-api-key", "authentication", "incorrect api key")
+    ):
+        return (
+            "The API key was rejected. Check for a stray space or quote in your .env "
+            "file, and that the key matches the LLM_PROVIDER you set."
+        )
+
+    if "model_not_found" in text or "does not exist" in text:
+        return (
+            "That model name isn't available on your account. Try a different "
+            "LLM_MODEL in your .env file."
+        )
+
+    return str(exc)
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Pull the first JSON object out of a model reply.
 
