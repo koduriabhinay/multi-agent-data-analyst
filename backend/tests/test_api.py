@@ -111,3 +111,38 @@ class TestRetrieval:
 
         assert client.delete(f"/api/analyses/{analysis_id}").status_code == 204
         assert client.get(f"/api/analyses/{analysis_id}").status_code == 404
+
+
+class TestSerialization:
+    """Regression tests for a real bug: NaN and Timestamps leaking into JSON.
+
+    `json.dumps` rejects both, so an upload with missing values or a date
+    column used to return a 500 once the results were fetched.
+    """
+
+    def test_handles_missing_values_and_dates(self, client):
+        rows = ["value,other,when"]
+        for i in range(60):
+            value = "" if i % 10 == 0 else str(i)  # deliberate gaps
+            rows.append(f"{value},{i * 3},2024-01-{i % 28 + 1:02d}")
+        upload = ("gappy.csv", io.BytesIO("\n".join(rows).encode()), "text/csv")
+
+        analysis_id = client.post("/api/analyses", files={"file": upload}).json()[
+            "analysis_id"
+        ]
+
+        response = client.get(f"/api/analyses/{analysis_id}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "completed"
+
+    def test_stored_payload_is_json_encodable(self, client, csv_upload):
+        import json
+
+        analysis_id = client.post("/api/analyses", files={"file": csv_upload}).json()[
+            "analysis_id"
+        ]
+        body = client.get(f"/api/analyses/{analysis_id}").json()
+
+        # allow_nan=False is what a strict JSON encoder does — this is the
+        # check that would have caught the original bug
+        json.dumps(body, allow_nan=False)

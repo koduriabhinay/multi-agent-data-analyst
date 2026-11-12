@@ -203,3 +203,32 @@ class TestPipeline:
         df = pd.DataFrame({"a": ["x"] * 30, "b": ["y"] * 30})
         result = run_pipeline_sync(new_state("t", "text.csv", df))
         assert result["status"] == "completed"
+
+
+class TestSerializationHelper:
+    def test_converts_nan_to_none(self):
+        from app.utils.serialization import json_safe
+
+        assert json_safe(float("nan")) is None
+        assert json_safe(float("inf")) is None
+
+    def test_converts_numpy_scalars(self):
+        from app.utils.serialization import json_safe
+
+        assert json_safe(np.int64(5)) == 5
+        assert json_safe(np.float64(2.5)) == 2.5
+        assert json_safe(np.bool_(True)) is True
+
+    def test_converts_timestamps_to_iso_strings(self):
+        from app.utils.serialization import json_safe
+
+        result = json_safe(pd.Timestamp("2024-03-01"))
+        assert result.startswith("2024-03-01")
+
+    def test_recurses_into_nested_structures(self):
+        import json
+
+        from app.utils.serialization import json_safe
+
+        messy = {"a": [np.float64("nan"), pd.Timestamp("2024-01-01")], "b": {"c": np.int32(3)}}
+        json.dumps(json_safe(messy), allow_nan=False)  # raises if anything leaked
